@@ -137,7 +137,7 @@ struct State {
     device: wgpu::Device,
     queue: wgpu::Queue,
     #[allow(dead_code)]
-    config: wgpu::SurfaceConfiguration,
+    surface_config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     model_render_pipeline: wgpu::RenderPipeline,
     obj_model: model::Model,
@@ -215,7 +215,7 @@ impl State {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
+        let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width,
@@ -224,8 +224,7 @@ impl State {
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
-
-        surface.configure(&device, &config);
+        surface.configure(&device, &surface_config);
 
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -270,7 +269,7 @@ impl State {
 
         let camera = camera::Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
         let projection =
-            camera::Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
+            camera::Projection::new(surface_config.width, surface_config.height, cgmath::Deg(45.0), 0.1, 100.0);
         let camera_controller = camera::CameraController::new(4.0, 0.4);
 
         let mut camera_uniform = CameraUniform::new();
@@ -380,7 +379,7 @@ impl State {
                 .unwrap();
 
         let depth_texture =
-            texture::Texture::create_depth_texture(&device, &config, "depth_texture");
+            texture::Texture::create_depth_texture(&device, &surface_config, "depth_texture");
 
         let model_render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -402,7 +401,7 @@ impl State {
                 Some("Model render Pipeline"),
                 &device,
                 &model_render_pipeline_layout,
-                config.format,
+                surface_config.format,
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc(), InstanceRaw::desc()],
                 shader,
@@ -423,7 +422,7 @@ impl State {
                 Some("Light Render Pipeline"),
                 &device,
                 &layout,
-                config.format,
+                surface_config.format,
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc()],
                 shader,
@@ -434,7 +433,7 @@ impl State {
             surface,
             device,
             queue,
-            config,
+            surface_config,
             size,
             model_render_pipeline,
             obj_model,

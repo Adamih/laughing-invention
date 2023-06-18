@@ -3,7 +3,6 @@ use std::iter;
 use cgmath::prelude::*;
 use wgpu::util::DeviceExt;
 use winit::{
-    dpi::PhysicalPosition,
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::Window,
@@ -137,6 +136,7 @@ struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    #[allow(dead_code)]
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     model_render_pipeline: wgpu::RenderPipeline,

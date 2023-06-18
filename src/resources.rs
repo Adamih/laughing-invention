@@ -1,78 +1,47 @@
-use std::io::{BufReader, Cursor};
+use std::{
+    io::{BufReader, Cursor},
+    path::Path,
+};
 
-use cfg_if::cfg_if;
+use anyhow::Context;
 use wgpu::util::DeviceExt;
 
 use crate::{model, texture};
 
-#[cfg(target_arch = "wasm32")]
-fn format_url(file_name: &str) -> reqwest::Url {
-    let window = web_sys::window().unwrap();
-    let location = window.location();
-    let mut origin = location.origin().unwrap();
-    if !origin.ends_with("learn-wgpu") {
-        origin = format!("{}/learn-wgpu", origin);
-    }
-    let base = reqwest::Url::parse(&format!("{}/", origin,)).unwrap();
-    base.join(file_name).unwrap()
-}
-
-pub async fn load_string(file_name: &str) -> anyhow::Result<String> {
-    cfg_if! {
-        if #[cfg(target_arch = "wasm32")] {
-            let url = format_url(file_name);
-            let txt = reqwest::get(url)
-                .await?
-                .text()
-                .await?;
-        } else {
-            let path = std::path::Path::new(env!("OUT_DIR"))
-                .join("res")
-                .join(file_name);
-            let txt = std::fs::read_to_string(path)?;
-        }
-    }
-
+pub async fn load_string(path: &Path) -> anyhow::Result<String> {
+    let path = std::path::Path::new(env!("OUT_DIR")).join(path);
+    let txt = std::fs::read_to_string(path)?;
     Ok(txt)
 }
 
-pub async fn load_binary(file_name: &str) -> anyhow::Result<Vec<u8>> {
-    cfg_if! {
-        if #[cfg(target_arch = "wasm32")] {
-            let url = format_url(file_name);
-            let data = reqwest::get(url)
-                .await?
-                .bytes()
-                .await?
-                .to_vec();
-        } else {
-            let path = std::path::Path::new(env!("OUT_DIR"))
-                .join("res")
-                .join(file_name);
-            let data = std::fs::read(path)?;
-        }
-    }
-
+pub async fn load_binary(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let path = std::path::Path::new(env!("OUT_DIR")).join(path);
+    let data = std::fs::read(path)?;
     Ok(data)
 }
 
 pub async fn load_texture(
-    file_name: &str,
+    path: &Path,
     is_normal_map: bool,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> anyhow::Result<texture::Texture> {
-    let data = load_binary(file_name).await?;
+    let data = load_binary(&path).await?;
+    let file_name = path.file_name().context("Failed to get file name")?;
+    let file_name = file_name.to_str().context("Failed to convert file name")?;
     texture::Texture::from_bytes(device, queue, &data, file_name, is_normal_map)
 }
 
-pub async fn load_model(
-    file_name: &str,
+pub async fn load_obj_model(
+    path: &Path,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
 ) -> anyhow::Result<model::Model> {
-    let obj_text = load_string(file_name).await?;
+    let file_name = path.file_name().context("Failed to get file name")?;
+    let file_name = file_name.to_str().context("Failed to convert file name")?;
+    let parent_folder = path.parent().context("Failed to get parent folder")?;
+    let obj_text = load_string(&path).await.context("Failed to read .obj file")?;
     let obj_cursor = Cursor::new(obj_text);
     let mut obj_reader = BufReader::new(obj_cursor);
 
@@ -84,16 +53,26 @@ pub async fn load_model(
             ..Default::default()
         },
         |p| async move {
-            let mat_text = load_string(&p).await.unwrap();
+            let path = parent_folder.join(p);
+            let mat_text = load_string(&path).await.unwrap();
             tobj::load_mtl_buf(&mut BufReader::new(Cursor::new(mat_text)))
         },
     )
-    .await?;
+    .await
+    .context("Failed to load .obj file")?;
+
+    let obj_materials = obj_materials.context("Failed to load .mtmaterials")?;
 
     let mut materials = Vec::new();
-    for m in obj_materials? {
-        let diffuse_texture = load_texture(&m.diffuse_texture, false, device, queue).await?;
-        let normal_texture = load_texture(&m.normal_texture, true, device, queue).await?;
+    for m in obj_materials {
+        let diffuse_texture_path = parent_folder.join(&m.diffuse_texture);
+        let diffuse_texture = load_texture(&diffuse_texture_path, false, device, queue)
+            .await
+            .context("Failed to load diffuse texture")?;
+        let normal_texture_path = parent_folder.join(&m.normal_texture);
+        let normal_texture = load_texture(&normal_texture_path, true, device, queue)
+            .await
+            .context("Failed to load normal texture")?;
 
         materials.push(model::Material::new(
             device,

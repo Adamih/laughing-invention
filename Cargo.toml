@@ -18,6 +18,7 @@ tobj = { version = "3.2", features = ["async"]}
 wgpu = "0.16"
 winit = "0.28"
 instant = "0.1"
+gltf = "1.2.0"
 
 [dependencies.image]
 version = "0.24"

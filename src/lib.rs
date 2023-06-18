@@ -1,5 +1,6 @@
 use std::iter;
 
+use anyhow::Context;
 use cgmath::prelude::*;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -159,7 +160,7 @@ struct State {
 }
 
 impl State {
-    async fn new(window: Window) -> Self {
+    async fn new(window: Window) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
@@ -174,7 +175,8 @@ impl State {
         //
         // The surface needs to live as long as the window that created it.
         // State owns the window so this should be safe.
-        let surface = unsafe { instance.create_surface(&window) }.unwrap();
+        let surface =
+            unsafe { instance.create_surface(&window) }.context("Failed to create surface")?;
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -183,7 +185,7 @@ impl State {
                 force_fallback_adapter: false,
             })
             .await
-            .unwrap();
+            .ok_or(anyhow::anyhow!("Failed to find an appropriate adapter"))?;
         log::warn!("device and queue");
         let (device, queue) = adapter
             .request_device(
@@ -202,7 +204,7 @@ impl State {
                 None, // Trace path
             )
             .await
-            .unwrap();
+            .context("Failed to create device")?;
 
         log::warn!("Surface");
         let surface_caps = surface.get_capabilities(&adapter);
@@ -268,8 +270,13 @@ impl State {
             });
 
         let camera = camera::Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
-        let projection =
-            camera::Projection::new(surface_config.width, surface_config.height, cgmath::Deg(45.0), 0.1, 100.0);
+        let projection = camera::Projection::new(
+            surface_config.width,
+            surface_config.height,
+            cgmath::Deg(45.0),
+            0.1,
+            100.0,
+        );
         let camera_controller = camera::CameraController::new(4.0, 0.4);
 
         let mut camera_uniform = CameraUniform::new();
@@ -373,10 +380,11 @@ impl State {
         });
 
         log::warn!("Load model");
+        let obj_path = std::path::Path::new("res/cube/cube.obj");
         let obj_model =
-            resources::load_model("cube.obj", &device, &queue, &texture_bind_group_layout)
+            resources::load_obj_model(obj_path, &device, &queue, &texture_bind_group_layout)
                 .await
-                .unwrap();
+                .context("Failed to load model")?;
 
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &surface_config, "depth_texture");
@@ -429,7 +437,7 @@ impl State {
             )
         };
 
-        Self {
+        Ok(Self {
             surface,
             device,
             queue,
@@ -452,7 +460,7 @@ impl State {
             depth_texture,
             window,
             mouse_pressed: false,
-        }
+        })
     }
 
     pub fn window(&self) -> &Window {
@@ -554,7 +562,7 @@ impl State {
             // Light
             use crate::model::DrawLight;
 
-            render_pass.set_pipeline(&self.light_render_pipeline); // NEW!
+            render_pass.set_pipeline(&self.light_render_pipeline);
             render_pass.draw_light_model(
                 &self.obj_model,
                 &self.camera_bind_group,
@@ -594,7 +602,7 @@ pub async fn run() {
     let window = winit::window::WindowBuilder::new()
         .with_title(title)
         .build(&event_loop)
-        .unwrap();
+        .expect("Failed to create window");
 
     #[cfg(target_arch = "wasm32")]
     {
@@ -616,7 +624,9 @@ pub async fn run() {
     }
 
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = State::new(window).await;
+    let mut state = State::new(window)
+        .await
+        .expect("Failed to initialize state");
     let mut last_render_time = instant::Instant::now();
 
     event_loop.run(move |event, _, control_flow| {

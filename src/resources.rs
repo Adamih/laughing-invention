@@ -1,47 +1,84 @@
-use std::{
-    io::{BufReader, Cursor},
-    path::Path,
-};
+use std::io::{BufReader, Cursor};
 
-use anyhow::Context;
+use cfg_if::cfg_if;
+use gltf::Gltf;
 use wgpu::util::DeviceExt;
 
-use crate::{model, texture};
+use crate::{
+    model::{self, AnimationClip, Keyframes, ModelVertex},
+    texture,
+};
 
-pub async fn load_string(path: &Path) -> anyhow::Result<String> {
-    let path = std::path::Path::new(env!("OUT_DIR")).join(path);
-    let txt = std::fs::read_to_string(path)?;
+#[cfg(target_arch = "wasm32")]
+fn format_url(file_name: &str) -> reqwest::Url {
+    let window = web_sys::window().unwrap();
+    let location = window.location();
+    let base = reqwest::Url::parse(&format!(
+        "{}/{}/",
+        location.origin().unwrap(),
+        option_env!("RES_PATH").unwrap_or("assets"),
+    ))
+    .unwrap();
+    base.join(file_name).unwrap()
+}
+
+pub async fn load_string(file_name: &str) -> anyhow::Result<String> {
+    cfg_if! {
+        if #[cfg(target_arch = "wasm32")] {
+            log::warn!("Load model on web");
+
+            let url = format_url(file_name);
+            let txt = reqwest::get(url)
+                .await?
+                .text()
+                .await?;
+
+            log::warn!("{}", txt);
+
+        } else {
+            let path = std::path::Path::new("assets")
+                .join(file_name);
+            let txt = std::fs::read_to_string(path)?;
+        }
+    }
+
     Ok(txt)
 }
 
-pub async fn load_binary(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let path = std::path::Path::new(env!("OUT_DIR")).join(path);
-    let data = std::fs::read(path)?;
+pub async fn load_binary(file_name: &str) -> anyhow::Result<Vec<u8>> {
+    cfg_if! {
+        if #[cfg(target_arch = "wasm32")] {
+            let url = format_url(file_name);
+            let data = reqwest::get(url)
+                .await?
+                .bytes()
+                .await?
+                .to_vec();
+        } else {
+            let path = std::path::Path::new("assets")
+                .join(file_name);
+            let data = std::fs::read(path)?;
+        }
+    }
+
     Ok(data)
 }
 
 pub async fn load_texture(
-    path: &Path,
-    is_normal_map: bool,
+    file_name: &str,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> anyhow::Result<texture::Texture> {
-    let data = load_binary(&path).await?;
-    let file_name = path.file_name().context("Failed to get file name")?;
-    let file_name = file_name.to_str().context("Failed to convert file name")?;
-    texture::Texture::from_bytes(device, queue, &data, file_name, is_normal_map)
+    let data = load_binary(file_name).await?;
+    texture::Texture::from_bytes(device, queue, &data, file_name)
 }
 
-pub async fn load_obj_model(
-    path: &Path,
+pub async fn load_model(
+    file_name: &str,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    layout: &wgpu::BindGroupLayout,
 ) -> anyhow::Result<model::Model> {
-    let file_name = path.file_name().context("Failed to get file name")?;
-    let file_name = file_name.to_str().context("Failed to convert file name")?;
-    let parent_folder = path.parent().context("Failed to get parent folder")?;
-    let obj_text = load_string(&path).await.context("Failed to read .obj file")?;
+    let obj_text = load_string(file_name).await?;
     let obj_cursor = Cursor::new(obj_text);
     let mut obj_reader = BufReader::new(obj_cursor);
 
@@ -53,40 +90,26 @@ pub async fn load_obj_model(
             ..Default::default()
         },
         |p| async move {
-            let path = parent_folder.join(p);
-            let mat_text = load_string(&path).await.unwrap();
+            let mat_text = load_string(&p).await.unwrap();
             tobj::load_mtl_buf(&mut BufReader::new(Cursor::new(mat_text)))
         },
     )
-    .await
-    .context("Failed to load .obj file")?;
-
-    let obj_materials = obj_materials.context("Failed to load .mtmaterials")?;
+    .await?;
 
     let mut materials = Vec::new();
-    for m in obj_materials {
-        let diffuse_texture_path = parent_folder.join(&m.diffuse_texture);
-        let diffuse_texture = load_texture(&diffuse_texture_path, false, device, queue)
-            .await
-            .context("Failed to load diffuse texture")?;
-        let normal_texture_path = parent_folder.join(&m.normal_texture);
-        let normal_texture = load_texture(&normal_texture_path, true, device, queue)
-            .await
-            .context("Failed to load normal texture")?;
+    for m in obj_materials? {
+        let diffuse_texture = load_texture(&m.diffuse_texture, device, queue).await?;
 
-        materials.push(model::Material::new(
-            device,
-            &m.name,
+        materials.push(model::Material {
+            name: m.name,
             diffuse_texture,
-            normal_texture,
-            layout,
-        ));
+        })
     }
 
     let meshes = models
         .into_iter()
         .map(|m| {
-            let mut vertices = (0..m.mesh.positions.len() / 3)
+            let vertices = (0..m.mesh.positions.len() / 3)
                 .map(|i| model::ModelVertex {
                     position: [
                         m.mesh.positions[i * 3],
@@ -99,78 +122,8 @@ pub async fn load_obj_model(
                         m.mesh.normals[i * 3 + 1],
                         m.mesh.normals[i * 3 + 2],
                     ],
-                    tangent: [0.0; 3],
-                    bitangent: [0.0; 3],
                 })
                 .collect::<Vec<_>>();
-
-            let indices = &m.mesh.indices;
-            let mut triangles_included = vec![0; vertices.len()];
-
-            // Calculate tangents and bitangets. We're going to
-            // use the triangles, so we need to loop through the
-            // indices in chunks of 3
-            for c in indices.chunks(3) {
-                let v0 = vertices[c[0] as usize];
-                let v1 = vertices[c[1] as usize];
-                let v2 = vertices[c[2] as usize];
-
-                let pos0: cgmath::Vector3<_> = v0.position.into();
-                let pos1: cgmath::Vector3<_> = v1.position.into();
-                let pos2: cgmath::Vector3<_> = v2.position.into();
-
-                let uv0: cgmath::Vector2<_> = v0.tex_coords.into();
-                let uv1: cgmath::Vector2<_> = v1.tex_coords.into();
-                let uv2: cgmath::Vector2<_> = v2.tex_coords.into();
-
-                // Calculate the edges of the triangle
-                let delta_pos1 = pos1 - pos0;
-                let delta_pos2 = pos2 - pos0;
-
-                // This will give us a direction to calculate the
-                // tangent and bitangent
-                let delta_uv1 = uv1 - uv0;
-                let delta_uv2 = uv2 - uv0;
-
-                // Solving the following system of equations will
-                // give us the tangent and bitangent.
-                //     delta_pos1 = delta_uv1.x * T + delta_u.y * B
-                //     delta_pos2 = delta_uv2.x * T + delta_uv2.y * B
-                // Luckily, the place I found this equation provided
-                // the solution!
-                let r = 1.0 / (delta_uv1.x * delta_uv2.y - delta_uv1.y * delta_uv2.x);
-                let tangent = (delta_pos1 * delta_uv2.y - delta_pos2 * delta_uv1.y) * r;
-                // We flip the bitangent to enable right-handed normal
-                // maps with wgpu texture coordinate system
-                let bitangent = (delta_pos2 * delta_uv1.x - delta_pos1 * delta_uv2.x) * -r;
-
-                // We'll use the same tangent/bitangent for each vertex in the triangle
-                vertices[c[0] as usize].tangent =
-                    (tangent + cgmath::Vector3::from(vertices[c[0] as usize].tangent)).into();
-                vertices[c[1] as usize].tangent =
-                    (tangent + cgmath::Vector3::from(vertices[c[1] as usize].tangent)).into();
-                vertices[c[2] as usize].tangent =
-                    (tangent + cgmath::Vector3::from(vertices[c[2] as usize].tangent)).into();
-                vertices[c[0] as usize].bitangent =
-                    (bitangent + cgmath::Vector3::from(vertices[c[0] as usize].bitangent)).into();
-                vertices[c[1] as usize].bitangent =
-                    (bitangent + cgmath::Vector3::from(vertices[c[1] as usize].bitangent)).into();
-                vertices[c[2] as usize].bitangent =
-                    (bitangent + cgmath::Vector3::from(vertices[c[2] as usize].bitangent)).into();
-
-                // Used to average the tangents/bitangents
-                triangles_included[c[0] as usize] += 1;
-                triangles_included[c[1] as usize] += 1;
-                triangles_included[c[2] as usize] += 1;
-            }
-
-            // Average the tangents/bitangents
-            for (i, n) in triangles_included.into_iter().enumerate() {
-                let denom = 1.0 / n as f32;
-                let mut v = &mut vertices[i];
-                v.tangent = (cgmath::Vector3::from(v.tangent) * denom).into();
-                v.bitangent = (cgmath::Vector3::from(v.bitangent) * denom).into();
-            }
 
             let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("{:?} Vertex Buffer", file_name)),
@@ -193,5 +146,198 @@ pub async fn load_obj_model(
         })
         .collect::<Vec<_>>();
 
-    Ok(model::Model { meshes, materials })
+    let animations = Vec::new();
+
+    Ok(model::Model {
+        meshes,
+        materials,
+        animations,
+    })
+}
+
+pub async fn load_model_gltf(
+    file_name: &str,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> anyhow::Result<model::Model> {
+    let gltf_text = load_string(file_name).await?;
+    let gltf_cursor = Cursor::new(gltf_text);
+    let gltf_reader = BufReader::new(gltf_cursor);
+    let gltf = Gltf::from_reader(gltf_reader)?;
+
+    // Load buffers
+    let mut buffer_data = Vec::new();
+    for buffer in gltf.buffers() {
+        match buffer.source() {
+            gltf::buffer::Source::Bin => {
+                if let Some(blob) = gltf.blob.as_deref() {
+                    buffer_data.push(blob.into());
+                    println!("Found a bin, saving");
+                };
+            }
+            gltf::buffer::Source::Uri(uri) => {
+                let bin = load_binary(uri).await?;
+                buffer_data.push(bin);
+            }
+        }
+    }
+
+    // Load animations
+    let mut animation_clips = Vec::new();
+    for animation in gltf.animations() {
+        for channel in animation.channels() {
+            let reader = channel.reader(|buffer| Some(&buffer_data[buffer.index()]));
+            let timestamps = if let Some(inputs) = reader.read_inputs() {
+                match inputs {
+                    gltf::accessor::Iter::Standard(times) => {
+                        let times: Vec<f32> = times.collect();
+                        println!("Time: {}", times.len());
+                        // dbg!(&times);
+                        times
+                    }
+                    gltf::accessor::Iter::Sparse(_) => {
+                        println!("Sparse keyframes not supported");
+                        let times: Vec<f32> = Vec::new();
+                        times
+                    }
+                }
+            } else {
+                println!("We got problems");
+                let times: Vec<f32> = Vec::new();
+                times
+            };
+
+            let keyframes = if let Some(outputs) = reader.read_outputs() {
+                match outputs {
+                    gltf::animation::util::ReadOutputs::Translations(translation) => {
+                        let translation_vec = translation.map(|tr| {
+                            // println!("Translation:");
+                            // dbg!(&tr);
+                            let vector: Vec<f32> = tr.into();
+                            vector
+                        }).collect();
+                        Keyframes::Translation(translation_vec)
+                    },
+                    _ => {
+                        Keyframes::Other
+                    }
+                    // gltf::animation::util::ReadOutputs::Rotations(_) => todo!(),
+                    // gltf::animation::util::ReadOutputs::Scales(_) => todo!(),
+                    // gltf::animation::util::ReadOutputs::MorphTargetWeights(_) => todo!(),
+                }
+            } else {
+                println!("We got problems");
+                Keyframes::Other
+            };
+
+            animation_clips.push(AnimationClip {
+                name: animation.name().unwrap_or("Default").to_string(),
+                keyframes,
+                timestamps,
+            })
+        }
+    }
+
+    // Load materials
+    let mut materials = Vec::new();
+    for material in gltf.materials() {
+        let pbr = material.pbr_metallic_roughness();
+        let base_color_texture = &pbr.base_color_texture();
+        let texture_source = &pbr
+            .base_color_texture()
+            .map(|tex| tex.texture().source().source())
+            .expect("texture");
+
+        match texture_source {
+            gltf::image::Source::View { view, mime_type } => {
+                let diffuse_texture = texture::Texture::from_bytes(
+                    device,
+                    queue,
+                    &buffer_data[view.buffer().index()],
+                    file_name,
+                )
+                .expect("Couldn't load diffuse");
+
+                materials.push(model::Material {
+                    name: material.name().unwrap_or("Default Material").to_string(),
+                    diffuse_texture,
+                });
+            }
+            gltf::image::Source::Uri { uri, mime_type } => {
+                let diffuse_texture = load_texture(uri, device, queue).await?;
+
+                materials.push(model::Material {
+                    name: material.name().unwrap_or("Default Material").to_string(),
+                    diffuse_texture,
+                });
+            }
+        };
+    }
+
+    let mut meshes = Vec::new();
+
+    for scene in gltf.scenes() {
+        for node in scene.nodes() {
+            dbg!(node.name());
+            let mesh = node.mesh().expect("Got mesh");
+            let primitives = mesh.primitives();
+            primitives.for_each(|primitive| {
+                let reader = primitive.reader(|buffer| Some(&buffer_data[buffer.index()]));
+                let mut vertices = Vec::new();
+                if let Some(vertex_attribute) = reader.read_positions() {
+                    vertex_attribute.for_each(|vertex| {
+                        vertices.push(ModelVertex {
+                            position: vertex,
+                            tex_coords: Default::default(),
+                            normal: Default::default(),
+                        })
+                    });
+                }
+                if let Some(normal_attribute) = reader.read_normals() {
+                    let mut normal_index = 0;
+                    normal_attribute.for_each(|normal| {
+                        vertices[normal_index].normal = normal;
+                        normal_index += 1;
+                    });
+                }
+                if let Some(tex_coord_attribute) = reader.read_tex_coords(0).map(|v| v.into_f32()) {
+                    let mut tex_coord_index = 0;
+                    tex_coord_attribute.for_each(|tex_coord| {
+                        vertices[tex_coord_index].tex_coords = tex_coord;
+                        tex_coord_index += 1;
+                    });
+                }
+
+                let mut indices = Vec::new();
+                if let Some(indices_raw) = reader.read_indices() {
+                    indices.append(&mut indices_raw.into_u32().collect::<Vec<u32>>());
+                }
+                let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("{:?} Vertex Buffer", file_name)),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("{:?} Index Buffer", file_name)),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+
+                meshes.push(model::Mesh {
+                    name: file_name.to_string(),
+                    vertex_buffer,
+                    index_buffer,
+                    num_elements: indices.len() as u32,
+                    // material: m.mesh.material_id.unwrap_or(0),
+                    material: 0,
+                });
+            });
+        }
+    }
+
+    Ok(model::Model {
+        meshes,
+        materials,
+        animations: animation_clips,
+    })
 }

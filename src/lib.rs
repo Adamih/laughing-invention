@@ -1,295 +1,131 @@
-use std::iter;
+use std::{iter, time::Instant};
 
-use anyhow::Context;
 use cgmath::prelude::*;
+use context::GraphicsContext;
+use node::Node;
+use pass::{phong::PhongPass, Pass};
 use wgpu::util::DeviceExt;
 use winit::{
+    dpi::PhysicalPosition,
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    window::Window,
 };
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
 mod camera;
+mod context;
+mod instance;
 mod model;
+mod node;
+mod pass;
+mod primitives;
 mod resources;
 mod texture;
-
-use model::{DrawModel, Vertex};
-
-const NUM_INSTANCES_PER_ROW: u32 = 10;
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
-    view_position: [f32; 4],
-    view_proj: [[f32; 4]; 4],
-}
-
-impl CameraUniform {
-    fn new() -> Self {
-        Self {
-            view_position: [0.0; 4],
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
-    }
-
-    fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
-        // We are using vec4 here instead of vec3 due to wgpu requiring 16 byte (4 float) spacing
-        self.view_position = camera.position.to_homogeneous().into();
-        self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into();
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct LightUniform {
-    position: [f32; 3],
-    // Due to uniforms requiring 16 byte (4 float) spacing, we need to use a padding field here
-    _padding: u32,
-    color: [f32; 3],
-    // Due to uniforms requiring 16 byte (4 float) spacing, we need to use a padding field here
-    _padding2: u32,
-}
-
-impl LightUniform {}
-
-struct Instance {
-    position: cgmath::Vector3<f32>,
-    rotation: cgmath::Quaternion<f32>,
-}
-
-impl Instance {
-    fn to_raw(&self) -> InstanceRaw {
-        InstanceRaw {
-            model: (cgmath::Matrix4::from_translation(self.position)
-                * cgmath::Matrix4::from(self.rotation))
-            .into(),
-            normal: cgmath::Matrix3::from(self.rotation).into(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct InstanceRaw {
-    model: [[f32; 4]; 4],
-    normal: [[f32; 3]; 3],
-}
-
-impl InstanceRaw {
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        use std::mem;
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
-            // We need to switch from using a step mode of Vertex to Instance
-            // This means that our shaders will only change to use the next
-            // instance when the shader starts processing a new instance
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    // While our vertex shader only uses locations 0, and 1 now, in later tutorials we'll
-                    // be using 2, 3, and 4, for Vertex. We'll start at slot 5 not conflict with them later
-                    shader_location: 5,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
-                // for each vec4. We don't have to do this in code though.
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    shader_location: 6,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
-                    shader_location: 7,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
-                    shader_location: 8,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
-                    shader_location: 9,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 19]>() as wgpu::BufferAddress,
-                    shader_location: 10,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 22]>() as wgpu::BufferAddress,
-                    shader_location: 11,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-            ],
-        }
-    }
-}
+mod window;
+use crate::{
+    camera::{Camera, CameraController, CameraUniform},
+    context::create_render_pipeline,
+    model::Keyframes,
+    pass::phong::{Locals, PhongConfig},
+    primitives::{sphere::generate_sphere, PrimitiveMesh},
+    window::Window,
+};
+use crate::{
+    instance::{Instance, InstanceRaw},
+    window::WindowEvents,
+};
+use model::{DrawLight, DrawModel, Vertex};
 
 struct State {
-    surface: wgpu::Surface,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    #[allow(dead_code)]
-    surface_config: wgpu::SurfaceConfiguration,
+    ctx: GraphicsContext,
+    pass: PhongPass,
+    // Window size
     size: winit::dpi::PhysicalSize<u32>,
-    model_render_pipeline: wgpu::RenderPipeline,
-    obj_model: model::Model,
-    camera: camera::Camera,
-    projection: camera::Projection,
-    camera_controller: camera::CameraController,
-    camera_uniform: CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-    light_uniform: LightUniform,
-    light_buffer: wgpu::Buffer,
-    light_bind_group: wgpu::BindGroup,
-    light_render_pipeline: wgpu::RenderPipeline,
-    instances: Vec<Instance>,
-    instance_buffer: wgpu::Buffer,
-    depth_texture: texture::Texture,
-    window: Window,
-    mouse_pressed: bool,
+    // Clear color for mouse interactions
+    clear_color: wgpu::Color,
+    // Camera
+    camera: Camera,
+    camera_controller: CameraController,
+    // The 3D models in the scene (as Nodes)
+    nodes: Vec<Node>,
+    // Animation
+    time: Instant,
 }
 
 impl State {
-    async fn new(window: Window) -> anyhow::Result<Self> {
-        let size = window.inner_size();
+    // Initialize the state
+    async fn new(window: &Window) -> Self {
+        // Save the window size for use later
+        let size = window.window.inner_size();
 
-        // The instance is a handle to our GPU
-        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
-        log::warn!("WGPU setup");
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            dx12_shader_compiler: Default::default(),
-        });
+        // Initialize the graphic context
+        let ctx = GraphicsContext::new(&window).await;
 
-        // # Safety
-        //
-        // The surface needs to live as long as the window that created it.
-        // State owns the window so this should be safe.
-        let surface =
-            unsafe { instance.create_surface(&window) }.context("Failed to create surface")?;
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok_or(anyhow::anyhow!("Failed to find an appropriate adapter"))?;
-        log::warn!("device and queue");
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Device"),
-                    features: wgpu::Features::empty(),
-                    // WebGL doesn't support all of wgpu's features, so if
-                    // we're building for the web we'll have to disable some.
-                    limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
-                    } else {
-                        wgpu::Limits::default()
-                    },
-                },
-                // Some(&std::path::Path::new("trace")), // Trace path
-                None, // Trace path
-            )
-            .await
-            .context("Failed to create device")?;
-
-        log::warn!("Surface");
-        let surface_caps = surface.get_capabilities(&adapter);
-        // Shader code in this tutorial assumes an Srgb surface texture. Using a different
-        // one will result all the colors comming out darker. If you want to support non
-        // Srgb surfaces, you'll need to account for that when drawing to the frame.
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
+        // Setup the camera and it's initial position
+        let camera = Camera {
+            eye: (0.0, 5.0, -10.0).into(),
+            target: (0.0, 0.0, 0.0).into(),
+            up: cgmath::Vector3::unit_y(),
+            aspect: ctx.config.width as f32 / ctx.config.height as f32,
+            fovy: 45.0,
+            znear: 0.1,
+            zfar: 100.0,
         };
-        surface.configure(&device, &surface_config);
+        let camera_controller = CameraController::new(0.2);
 
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    // diffuse texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // normal map
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("Texture Bind Group Layout"),
-            });
+        // Initialize the pass
+        let pass_config = PhongConfig {
+            max_lights: 1,
+            ambient: Default::default(),
+            wireframe: false,
+        };
+        let pass = PhongPass::new(&pass_config, &ctx.device, &ctx.queue, &ctx.config, &camera);
 
-        let camera = camera::Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
-        let projection = camera::Projection::new(
-            surface_config.width,
-            surface_config.height,
-            cgmath::Deg(45.0),
-            0.1,
-            100.0,
-        );
-        let camera_controller = camera::CameraController::new(4.0, 0.4);
+        // Create the 3D objects!
+        // Load 3D model from disk or as a HTTP request (for web support)
+        log::warn!("Load model");
+        let obj_model = resources::load_model("banana.obj", &ctx.device, &ctx.queue)
+            .await
+            .expect("Couldn't load model. Maybe path is wrong?");
+        let ferris_model = resources::load_model("ferris.obj", &ctx.device, &ctx.queue)
+            .await
+            .expect("Couldn't load model. Maybe path is wrong?");
+        let gltf_model =
+            resources::load_model_gltf("Cube-Tris-Textured-Animated.gltf", &ctx.device, &ctx.queue)
+                .await
+                .expect("Couldn't load model. Maybe path is wrong?");
 
-        let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, &projection);
+        let cube_primitive = PrimitiveMesh::new(
+            &ctx.device,
+            &ctx.queue,
+            &primitives::cube::cube_vertices(0.5),
+            &primitives::cube::cube_indices(),
+        )
+        .await;
 
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let plane_primitive = PrimitiveMesh::new(
+            &ctx.device,
+            &ctx.queue,
+            &primitives::plane::plane_vertices(0.5),
+            &primitives::plane::plane_indices(),
+        )
+        .await;
 
+        let (sphere_vertices, sphere_indices) = generate_sphere(2.0, 36, 18);
+
+        let sphere_primitive =
+            PrimitiveMesh::new(&ctx.device, &ctx.queue, &sphere_vertices, &sphere_indices).await;
+
+        // Create instances for each object with locational data (position + rotation)
+        // Renderer currently defaults to using instances. Want one object? Pass a Vec of 1 instance.
+
+        // We create a 2x2 grid of objects by doing 1 nested loop here
+        // And use the "displacement" matrix above to offset objects with a gap
         const SPACE_BETWEEN: f32 = 3.0;
-        let instances = (0..NUM_INSTANCES_PER_ROW)
+        const NUM_INSTANCES_PER_ROW: u32 = 10;
+        let banana_instances = (0..NUM_INSTANCES_PER_ROW)
             .flat_map(|z| {
                 (0..NUM_INSTANCES_PER_ROW).map(move |x| {
                     let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
@@ -311,278 +147,251 @@ impl State {
             })
             .collect::<Vec<_>>();
 
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        // More "manual" placement as an example
+        let ferris_instances = (0..2)
+            .map(|z| {
+                let z = SPACE_BETWEEN * (z as f32);
+                let position = cgmath::Vector3 { x: z, y: 1.0, z };
+                let rotation = if position.is_zero() {
+                    cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                } else {
+                    cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
+                };
+                Instance { position, rotation }
+            })
+            .collect::<Vec<_>>();
 
-        let camera_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("camera_bind_group_layout"),
-            });
+        // The cube primitive instances (aka positions)
+        let cube_primitive_instances = (0..2)
+            .map(|z| {
+                let z = SPACE_BETWEEN * (z as f32);
+                let position = cgmath::Vector3 {
+                    x: -z + 2.0,
+                    y: 2.0,
+                    z: -z,
+                };
+                let rotation = if position.is_zero() {
+                    cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                } else {
+                    cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
+                };
+                Instance { position, rotation }
+            })
+            .collect::<Vec<_>>();
 
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-            label: Some("camera_bind_group"),
-        });
+        let plane_primitive_instances = vec![Instance {
+            position: cgmath::Vector3 {
+                x: -3.0,
+                y: 3.0,
+                z: -3.0,
+            },
+            rotation: cgmath::Quaternion::from_axis_angle(
+                cgmath::Vector3::unit_z(),
+                cgmath::Deg(0.0),
+            ),
+        }];
 
-        let light_uniform = LightUniform {
-            position: [2.0, 2.0, 2.0],
-            _padding: 0,
-            color: [1.0, 1.0, 1.0],
-            _padding2: 0,
+        let sphere_primitive_instances = vec![Instance {
+            position: cgmath::Vector3 {
+                x: 3.0,
+                y: 3.0,
+                z: 3.0,
+            },
+            rotation: cgmath::Quaternion::from_axis_angle(
+                cgmath::Vector3::unit_z(),
+                cgmath::Deg(0.0),
+            ),
+        }];
+
+        // Create the nodes
+        let banana_node = Node {
+            parent: 0,
+            locals: Locals {
+                position: [0.0, 0.0, 0.0, 0.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+                normal: [0.0, 0.0, 0.0, 0.0],
+                lights: [0.0, 0.0, 0.0, 0.0],
+            },
+            model: obj_model,
+            instances: banana_instances,
         };
 
-        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Light VB"),
-            contents: bytemuck::cast_slice(&[light_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let light_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("Light Bind Group Layout"),
-            });
-
-        let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &light_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_buffer.as_entire_binding(),
-            }],
-            label: Some("Light Bind Group"),
-        });
-
-        log::warn!("Load model");
-        let obj_path = std::path::Path::new("res/cube/cube.obj");
-        let obj_model =
-            resources::load_obj_model(obj_path, &device, &queue, &texture_bind_group_layout)
-                .await
-                .context("Failed to load model")?;
-
-        let depth_texture =
-            texture::Texture::create_depth_texture(&device, &surface_config, "depth_texture");
-
-        let model_render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                bind_group_layouts: &[
-                    &texture_bind_group_layout,
-                    &camera_bind_group_layout,
-                    &light_bind_group_layout,
-                ],
-                label: Some("Render Pipeline Layout"),
-                push_constant_ranges: &[],
-            });
-
-        let model_render_pipeline = {
-            let shader = wgpu::ShaderModuleDescriptor {
-                label: Some("Normal Shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-            };
-            create_render_pipeline(
-                Some("Model render Pipeline"),
-                &device,
-                &model_render_pipeline_layout,
-                surface_config.format,
-                Some(texture::Texture::DEPTH_FORMAT),
-                &[model::ModelVertex::desc(), InstanceRaw::desc()],
-                shader,
-            )
+        let ferris_node = Node {
+            parent: 0,
+            locals: Locals {
+                position: [0.0, 0.0, 0.0, 0.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+                normal: [0.0, 0.0, 0.0, 0.0],
+                lights: [0.0, 0.0, 0.0, 0.0],
+            },
+            model: ferris_model,
+            instances: ferris_instances,
         };
 
-        let light_render_pipeline = {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Light Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &light_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-            let shader = wgpu::ShaderModuleDescriptor {
-                label: Some("Light Shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("light.wgsl").into()),
-            };
-            create_render_pipeline(
-                Some("Light Render Pipeline"),
-                &device,
-                &layout,
-                surface_config.format,
-                Some(texture::Texture::DEPTH_FORMAT),
-                &[model::ModelVertex::desc()],
-                shader,
-            )
+        let cube_primitive_node = Node {
+            parent: 0,
+            locals: Locals {
+                position: [0.0, 0.0, 0.0, 0.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+                normal: [0.0, 0.0, 0.0, 0.0],
+                lights: [0.0, 0.0, 0.0, 0.0],
+            },
+            model: cube_primitive.model,
+            instances: cube_primitive_instances,
         };
 
-        Ok(Self {
-            surface,
-            device,
-            queue,
-            surface_config,
+        let plane_primitive_node = Node {
+            parent: 0,
+            locals: Locals {
+                position: [0.0, 0.0, 0.0, 0.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+                normal: [0.0, 0.0, 0.0, 0.0],
+                lights: [0.0, 0.0, 0.0, 0.0],
+            },
+            model: gltf_model,
+            instances: plane_primitive_instances,
+        };
+
+        let sphere_primitive_node = Node {
+            parent: 0,
+            locals: Locals {
+                position: [0.0, 0.0, 0.0, 0.0],
+                color: [0.0, 0.0, 1.0, 1.0],
+                normal: [0.0, 0.0, 0.0, 0.0],
+                lights: [0.0, 0.0, 0.0, 0.0],
+            },
+            model: sphere_primitive.model,
+            instances: sphere_primitive_instances,
+        };
+
+        // Put all our nodes into an Vector to loop over later
+        let nodes = vec![
+            banana_node,
+            ferris_node,
+            cube_primitive_node,
+            plane_primitive_node,
+            sphere_primitive_node,
+        ];
+
+        // Clear color used for mouse input interaction
+        let clear_color = wgpu::Color::BLACK;
+
+        let time = Instant::now();
+
+        Self {
+            ctx,
+            pass,
+            clear_color,
             size,
-            model_render_pipeline,
-            obj_model,
             camera,
-            projection,
             camera_controller,
-            camera_buffer,
-            camera_bind_group,
-            camera_uniform,
-            light_buffer,
-            light_bind_group,
-            light_uniform,
-            light_render_pipeline,
-            instances,
-            instance_buffer,
-            depth_texture,
-            window,
-            mouse_pressed: false,
-        })
-    }
-
-    pub fn window(&self) -> &Window {
-        &self.window
-    }
-
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        self.projection.resize(new_size.width, new_size.height);
-    }
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        virtual_keycode: Some(key),
-                        state,
-                        ..
-                    },
-                ..
-            } => self.camera_controller.process_keyboard(*key, *state),
-            WindowEvent::MouseWheel { delta, .. } => {
-                self.camera_controller.process_scroll(delta);
-                true
-            }
-            WindowEvent::MouseInput {
-                button: MouseButton::Left,
-                state,
-                ..
-            } => {
-                self.mouse_pressed = *state == ElementState::Pressed;
-                true
-            }
-            _ => false,
+            nodes,
+            time,
         }
     }
 
-    fn update(&mut self, dt: instant::Duration) {
-        self.camera_controller.update_camera(&mut self.camera, dt);
-        self.camera_uniform
-            .update_view_proj(&self.camera, &self.projection);
-        self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::cast_slice(&[self.camera_uniform]),
-        );
-        let old_position: cgmath::Vector3<_> = self.light_uniform.position.into();
-        self.light_uniform.position = (cgmath::Quaternion::from_axis_angle(
-            (0.0, 1.0, 0.0).into(),
-            cgmath::Deg(60.0 * dt.as_secs_f32()),
-        ) * old_position)
-            .into();
-        self.queue.write_buffer(
-            &self.light_buffer,
-            0,
-            bytemuck::cast_slice(&[self.light_uniform]),
-        );
+    // Keeps state in sync with window size when changed
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
+            self.ctx.config.width = new_size.width;
+            self.ctx.config.height = new_size.height;
+            self.ctx
+                .surface
+                .configure(&self.ctx.device, &self.ctx.config);
+            // Make sure to current window size to depth texture - required for calc
+            self.pass.depth_texture = texture::Texture::create_depth_texture(
+                &self.ctx.device,
+                &self.ctx.config,
+                "depth_texture",
+            );
+        }
     }
 
+    // Handle input using WindowEvent
+    pub fn keyboard(&mut self, state: ElementState, keycode: &VirtualKeyCode) -> bool {
+        // Send any input to camera controller
+        self.camera_controller.process_events(&state, &keycode)
+    }
+
+    pub fn mouse_moved(&mut self, position: &PhysicalPosition<f64>) {
+        self.camera_controller
+            .process_mouse_moved(&position, &self.size);
+    }
+    pub fn mouse_input(
+        &mut self,
+        device_id: &DeviceId,
+        state: &ElementState,
+        button: &MouseButton,
+    ) {
+        self.camera_controller
+            .process_mouse_input(device_id, state, button);
+    }
+
+    fn update(&mut self) {
+        // Sync local app state with camera
+        self.camera_controller.update_camera(&mut self.camera);
+        self.pass.camera_uniform.update_view_proj(&self.camera);
+        self.ctx.queue.write_buffer(
+            &self.pass.global_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[self.pass.camera_uniform]),
+        );
+
+        // Update the light
+        let old_position: cgmath::Vector3<_> = self.pass.light_uniform.position.into();
+        self.pass.light_uniform.position =
+            (cgmath::Quaternion::from_axis_angle((0.0, 1.0, 0.0).into(), cgmath::Deg(1.0))
+                * old_position)
+                .into();
+        self.ctx.queue.write_buffer(
+            &self.pass.light_buffer,
+            0,
+            bytemuck::cast_slice(&[self.pass.light_uniform]),
+        );
+
+        // println!("Time elapsed: {:?}", &self.time.elapsed());
+
+        let current_time = self.time.elapsed().as_secs_f32();
+        let mut node_index = 0;
+
+        for node in &mut self.nodes {
+            // Play animations
+            if let Some(animation) = node.model.animations.first() {
+                let animation_duration = animation.timestamps.last().copied().unwrap_or(0.0);
+                let elapsed_time = current_time % animation_duration;
+
+                if let Some(current_keyframe_index) = animation
+                    .timestamps
+                    .iter()
+                    .position(|&timestamp| timestamp > elapsed_time)
+                {
+                    // Update locals with current animation
+                    if let Keyframes::Translation(frames) = &animation.keyframes {
+                        if let Some(current_frame) = frames.get(current_keyframe_index) {
+                            node.locals.position[0] = current_frame[0];
+                            node.locals.position[1] = current_frame[1];
+                            node.locals.position[2] = current_frame[2];
+                        }
+                    }
+                }
+            }
+
+            self.pass
+                .uniform_pool
+                .update_uniform(node_index, node.locals, &self.ctx.queue);
+            node_index += 1;
+        }
+    }
+
+    // Primary render flow
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture.view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: true,
-                    }),
-                    stencil_ops: None,
-                }),
-            });
-
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-
-            // Light
-            use crate::model::DrawLight;
-
-            render_pass.set_pipeline(&self.light_render_pipeline);
-            render_pass.draw_light_model(
-                &self.obj_model,
-                &self.camera_bind_group,
-                &self.light_bind_group,
-            );
-
-            // Model
-            render_pass.set_pipeline(&self.model_render_pipeline);
-            render_pass.draw_model_instanced(
-                &self.obj_model,
-                0..self.instances.len() as u32,
-                &self.camera_bind_group,
-                &self.light_bind_group,
-            );
-        }
-
-        self.queue.submit(iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
+        self.pass.draw(
+            &self.ctx.surface,
+            &self.ctx.device,
+            &self.ctx.queue,
+            &self.nodes,
+        )
     }
 }
 
@@ -591,32 +400,28 @@ pub async fn run() {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "wasm32")] {
             std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-            console_log::init_with_level(log::Level::Warn).expect("Could't initialize logger");
+            console_log::init_with_level(log::Level::Warn).expect("Couldn't initialize logger");
         } else {
             env_logger::init();
         }
     }
 
-    let event_loop = EventLoop::new();
-    let title = env!("CARGO_PKG_NAME");
-    let window = winit::window::WindowBuilder::new()
-        .with_title(title)
-        .build(&event_loop)
-        .expect("Failed to create window");
+    let window = Window::new();
 
+    // @TODO: Put inside Window module
     #[cfg(target_arch = "wasm32")]
     {
         // Winit prevents sizing with CSS, so we have to set
         // the size manually when on web.
         use winit::dpi::PhysicalSize;
-        window.set_inner_size(PhysicalSize::new(450, 400));
+        window.window.set_inner_size(PhysicalSize::new(450, 400));
 
         use winit::platform::web::WindowExtWebSys;
         web_sys::window()
             .and_then(|win| win.document())
             .and_then(|doc| {
-                let dst = doc.get_element_by_id("wasm-example")?;
-                let canvas = web_sys::Element::from(window.canvas());
+                let dst = doc.body()?;
+                let canvas = web_sys::Element::from(window.window.canvas());
                 dst.append_child(&canvas).ok()?;
                 Some(())
             })
@@ -624,123 +429,37 @@ pub async fn run() {
     }
 
     // State::new uses async code, so we're going to wait for it to finish
-    let mut state = State::new(window)
-        .await
-        .expect("Failed to initialize state");
-    let mut last_render_time = instant::Instant::now();
+    let mut app = State::new(&window).await;
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
-        match event {
-            Event::MainEventsCleared => state.window().request_redraw(),
-            Event::DeviceEvent {
-                event: DeviceEvent::MouseMotion{ delta, },
-                .. // We're not using device_id currently
-            } => if state.mouse_pressed {
-                state.camera_controller.process_mouse(delta.0, delta.1)
-            },
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == state.window().id() && !state.input(event) => {
-                match event {
-                    #[cfg(not(target_arch="wasm32"))]
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
-                                state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            },
-                        ..
-                    } => *control_flow = ControlFlow::Exit,
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(*physical_size);
-                    }
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        state.resize(**new_inner_size);
-                    }
-                    _ => {}
-                }
-            },
-            Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-                let now = instant::Instant::now();
-                let dt = now - last_render_time;
-                last_render_time = now;
-                state.update(dt);
-                match state.render() {
-                    Ok(_) => {}
-                    // Reconfigure the surface if it's lost or outdated
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        state.resize(state.size)
-                    }
-                    // The system is out of memory, we should probably quit
-                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                    // We're ignoring timeouts
-                    Err(wgpu::SurfaceError::Timeout) => log::warn!("Surface timeout"),
-                }
-            },
-            _ => {}
+    // @TODO: Wire up state methods again (like render)
+    window.run(move |event| match event {
+        WindowEvents::Resized { width, height } => {
+            app.resize(winit::dpi::PhysicalSize { width, height });
+        }
+        WindowEvents::Draw => {
+            app.update();
+            match app.render() {
+                Err(err) => println!("Error in rendering"),
+                Ok(_) => (),
+            }
+        }
+        WindowEvents::Keyboard {
+            state,
+            virtual_keycode,
+        } => {
+            app.keyboard(state, virtual_keycode);
+        }
+
+        WindowEvents::MouseMoved { position } => {
+            app.mouse_moved(position);
+        }
+
+        WindowEvents::MouseInput {
+            device_id,
+            state,
+            button,
+        } => {
+            app.mouse_input(device_id, state, button);
         }
     });
-}
-
-fn create_render_pipeline(
-    label: Option<&str>,
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    color_format: wgpu::TextureFormat,
-    depth_format: Option<wgpu::TextureFormat>,
-    vertex_layouts: &[wgpu::VertexBufferLayout],
-    shader: wgpu::ShaderModuleDescriptor,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(shader);
-
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label,
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: vertex_layouts,
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: color_format,
-                blend: Some(wgpu::BlendState {
-                    alpha: wgpu::BlendComponent::REPLACE,
-                    color: wgpu::BlendComponent::REPLACE,
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-            polygon_mode: wgpu::PolygonMode::Fill,
-            // Requires Features::DEPTH_CLIP_CONTROL
-            unclipped_depth: false,
-            // Requires Features::CONSERVATIVE_RASTERIZATION
-            conservative: false,
-        },
-        depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
-            format,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        multiview: None,
-    })
 }

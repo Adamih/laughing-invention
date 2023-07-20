@@ -26,7 +26,7 @@ pub async fn load_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> anyhow::Result<texture::Texture> {
-    let data = load_binary(&path).await?;
+    let data = load_binary(path).await?;
     let file_name = path.file_name().context("Failed to get file name")?;
     let file_name = file_name.to_str().context("Failed to convert file name")?;
     texture::Texture::from_bytes(device, queue, &data, file_name, is_normal_map)
@@ -41,7 +41,9 @@ pub async fn load_obj_model(
     let file_name = path.file_name().context("Failed to get file name")?;
     let file_name = file_name.to_str().context("Failed to convert file name")?;
     let parent_folder = path.parent().context("Failed to get parent folder")?;
-    let obj_text = load_string(&path).await.context("Failed to read .obj file")?;
+    let obj_text = load_string(path)
+        .await
+        .context("Failed to read .obj file")?;
     let obj_cursor = Cursor::new(obj_text);
     let mut obj_reader = BufReader::new(obj_cursor);
 

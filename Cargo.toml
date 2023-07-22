@@ -1,23 +1,22 @@
 [package]
-name = "render-rs"
+name = "test2"
 version = "0.1.0"
-edition = "2021"
+authors = ["Adam Henriksson <adam.ingemar.henriksson@gmail.com>"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0"
-bytemuck = { version = "1.12", features = [ "derive" ] }
+bytemuck = { version = "1.12", features = ["derive"] }
 cfg-if = "1"
 cgmath = "0.18"
 env_logger = "0.10"
 pollster = "0.3"
 log = "0.4"
-tobj = { version = "3.2", features = ["async"]}
+tobj = { version = "3.2", features = ["async"] }
 wgpu = "0.16"
 winit = "0.28"
-instant = "0.1"
 gltf = "1.2.0"
 
 [dependencies.image]
@@ -29,7 +28,7 @@ features = ["png", "jpeg"]
 reqwest = { version = "0.11" }
 console_error_panic_hook = "0.1"
 console_log = "1.0"
-wgpu = { version = "0.16", features = ["webgl"]}
+wgpu = { version = "0.16", features = ["webgl"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
@@ -37,7 +36,7 @@ web-sys = { version = "0.3", features = [
     "Window",
     "Element",
     "Location",
-]}
+] }
 
 [build-dependencies]
 anyhow = "1.0"
@@ -45,5 +44,5 @@ fs_extra = "1.2"
 glob = "0.3"
 
 [[bin]]
-name = "render-rs"
+name = "test2"
 path = "src/main.rs"
